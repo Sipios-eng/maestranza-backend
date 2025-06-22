@@ -20,7 +20,7 @@ DEBUG = False
 ALLOWED_HOSTS = [
     'localhost',
     '127.0.0.1',
-    '.pythonanywhere.com', # Para PythonAnywhere
+    'Sipios.pythonanywhere.com', # Para PythonAnywhere
     '.vercel.app', # Si tu frontend está en Netlify y lo accedes desde el backend
 ]
 
