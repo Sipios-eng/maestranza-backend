@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python/
+venv/                  # Ignorar el entorno virtual de Python
+.env                   # Ignorar el archivo de variables de entorno
+db.sqlite3             # Ignorar la base de datos SQLite local
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# Django specific
+/media/                # Archivos subidos por usuarios
+/staticfiles/          # Archivos estáticos recolectados
+local_settings.py
+
+# OS generated files
+.DS_Store
+Thumbs.db
