@@ -4,13 +4,14 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser, Group, Permission
 from django.db.models.signals import post_save, pre_save, pre_delete
 from django.dispatch import receiver
-from django.conf import settings # Para acceder al modelo de usuario configurado
+from django.conf import settings
+from datetime import date, timedelta
 
 # Definimos los roles de usuario como una tupla de tuplas
 USER_ROLES = (
     ('ADMIN', 'Administrador'),
     ('GESTOR_INV', 'Gestor de Inventario'),
-    ('COMPRADOR', 'Comprador'),
+    ('COMPRADOR', 'Comprador'), # El comprador usará el historial de precios
     ('LOGISTICA', 'Logística'),
     ('JEFE_PROD', 'Jefe de Producción'),
     ('AUDITOR', 'Auditor'),
@@ -112,6 +113,24 @@ class InventoryItem(models.Model):
     def __str__(self):
         return self.name
 
+    @property
+    def is_expiring_soon(self):
+        """
+        Determina si el ítem está por vencer pronto (ej. en los próximos 6 meses).
+        """
+        if self.expiration_date:
+            return self.expiration_date <= date.today() + timedelta(days=180) # Menos de 6 meses
+        return False
+
+    @property
+    def is_expired(self):
+        """
+        Determina si el ítem ya ha vencido.
+        """
+        if self.expiration_date:
+            return self.expiration_date <= date.today()
+        return False
+
 
 class InventoryMovement(models.Model):
     MOVEMENT_TYPES = (
@@ -164,6 +183,25 @@ class KitItem(models.Model):
         return f"{self.item.name} ({self.quantity}) en {self.kit.name}"
 
 
+# --- NUEVO MODELO: PurchaseRecord (Historial de Precios de Compra) ---
+class PurchaseRecord(models.Model):
+    item = models.ForeignKey(InventoryItem, on_delete=models.CASCADE, related_name='purchase_records', verbose_name="Ítem")
+    supplier = models.ForeignKey(Supplier, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_records', verbose_name="Proveedor")
+    purchase_date = models.DateField(default=date.today, verbose_name="Fecha de Compra")
+    unit_price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="Precio Unitario")
+    quantity_purchased = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="Cantidad Comprada")
+    notes = models.TextField(blank=True, null=True, verbose_name="Notas de Compra")
+    recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Registrado por")
+
+    class Meta:
+        verbose_name = "Registro de Compra"
+        verbose_name_plural = "Registros de Compra"
+        ordering = ['-purchase_date', 'item__name'] # Ordenar por fecha descendente y luego por nombre del ítem
+
+    def __str__(self):
+        return f"Compra de {self.quantity_purchased} de {self.item.name} a ${self.unit_price} el {self.purchase_date}"
+
+
 # --- Señales de Django ---
 
 @receiver(pre_save, sender=InventoryMovement)
@@ -179,15 +217,12 @@ def store_old_movement_data(sender, instance, **kwargs):
             # Almacenar los valores antiguos temporalmente
             instance._old_quantity = old_instance.quantity
             instance._old_movement_type = old_instance.movement_type
-            print(f"[PRE_SAVE DEBUG] Almacenando datos antiguos para movimiento {instance.pk}: Cantidad={old_instance.quantity}, Tipo={old_instance.movement_type}")
         except sender.DoesNotExist:
             instance._old_quantity = None
             instance._old_movement_type = None
-            print(f"[PRE_SAVE DEBUG] No se encontró instancia antigua para {instance.pk}, posible nueva creación o problema.")
     else: # Es una nueva creación
         instance._old_quantity = None
         instance._old_movement_type = None
-        print(f"[PRE_SAVE DEBUG] Nuevo movimiento detectado. No hay datos antiguos para almacenar.")
 
 
 @receiver(post_save, sender=InventoryMovement)
@@ -196,33 +231,25 @@ def update_inventory_quantity(sender, instance, created, **kwargs):
     Actualiza la cantidad del InventoryItem asociado después de un movimiento.
     Maneja tanto creaciones como actualizaciones de movimientos.
     """
-    print(f"--- Señal 'post_save' para InventoryMovement activada (ID: {instance.pk}, Creado: {created}) ---")
-    
     try:
         # Obtener el InventoryItem más reciente desde la base de datos
-        # Esto asegura que trabajamos con el valor de stock actual, evitando problemas de caché.
         item = InventoryItem.objects.get(pk=instance.item.pk)
         current_item_quantity = item.quantity # Cantidad actual del ítem en DB
-        print(f"DEBUG: Cantidad inicial de '{item.name}' obtenida de DB: {current_item_quantity}")
     except InventoryItem.DoesNotExist:
         print(f"ERROR: InventoryItem con ID {instance.item.pk} no encontrado para el movimiento {instance.pk}. No se puede actualizar el stock.")
         return # Salir si el ítem no existe
 
-    # --- Lógica de cálculo de la nueva cantidad ---
-    new_quantity_value = current_item_quantity # Empezamos con la cantidad actual
+    new_quantity_value = current_item_quantity
 
     if created: # Es un nuevo movimiento
-        print(f"DEBUG: Manejando NUEVO movimiento. Tipo: {instance.movement_type}, Cantidad: {instance.quantity}")
         if instance.movement_type == 'ENTRADA' or instance.movement_type == 'DEVOLUCION':
             new_quantity_value += instance.quantity
         elif instance.movement_type == 'SALIDA' or instance.movement_type == 'TRANSFERENCIA':
             new_quantity_value -= instance.quantity
-        print(f"DEBUG: Nueva cantidad calculada para '{item.name}' (creación): {new_quantity_value}")
 
     else: # El movimiento fue actualizado
         old_quantity = getattr(instance, '_old_quantity', None)
         old_movement_type = getattr(instance, '_old_movement_type', None)
-        print(f"DEBUG: Manejando movimiento ACTUALIZADO. Cantidad Antigua: {old_quantity}, Tipo Antiguo: {old_movement_type}, Cantidad Nueva: {instance.quantity}, Tipo Nuevo: {instance.movement_type}")
 
         if old_quantity is not None and old_movement_type is not None:
             # Revertir el efecto del movimiento antiguo
@@ -236,69 +263,60 @@ def update_inventory_quantity(sender, instance, created, **kwargs):
                 new_quantity_value += instance.quantity
             elif instance.movement_type == 'SALIDA' or instance.movement_type == 'TRANSFERENCIA':
                 new_quantity_value -= instance.quantity
-            
-            print(f"DEBUG: Nueva cantidad calculada para '{item.name}' (actualización): {new_quantity_value}")
         else:
-            print(f"ADVERTENCIA: No se pudieron obtener los datos antiguos para el movimiento {instance.pk}. No se pudo recalcular el stock de forma precisa.")
             # Fallback: Si no hay datos antiguos, solo aplicar el nuevo cambio de forma simple
             if instance.movement_type == 'ENTRADA' or instance.movement_type == 'DEVOLUCION':
                 new_quantity_value += instance.quantity
             elif instance.movement_type == 'SALIDA' or instance.movement_type == 'TRANSFERENCIA':
                 new_quantity_value -= instance.quantity
-            print(f"ADVERTENCIA DEBUG: Aplicando cambio nuevo para '{item.name}' como fallback.")
 
-    # --- Actualizar la cantidad en la base de datos ---
+    # Actualizar la cantidad en la base de datos de forma directa
     try:
-        # Usamos .update() en el QuerySet para realizar una actualización directa en la DB.
-        # Esto es más seguro y no disparará señales adicionales del InventoryItem.
         InventoryItem.objects.filter(pk=item.pk).update(quantity=new_quantity_value)
-        # Para la comprobación del umbral, cargamos el ítem actualizado
-        item_for_threshold_check = InventoryItem.objects.get(pk=item.pk) 
-        print(f"DEBUG: Cantidad de '{item_for_threshold_check.name}' actualizada directamente en DB a: {item_for_threshold_check.quantity}")
+        # Recargar el ítem desde la DB para la comprobación del umbral y vencimiento
+        item_updated_from_db = InventoryItem.objects.get(pk=item.pk)
     except Exception as e:
         print(f"ERROR: Fallo al actualizar la cantidad del ítem '{item.name}' en la base de datos: {e}")
         return # Salir si no se pudo actualizar la DB
 
-    # --- Verificar el umbral de stock bajo y mostrar alerta en consola ---
-    print(f"DEBUG: Verificando umbral para '{item_for_threshold_check.name}'. Cantidad actual: {item_for_threshold_check.quantity}, Umbral: {item_for_threshold_check.low_stock_threshold}")
-    if item_for_threshold_check.quantity <= item_for_threshold_check.low_stock_threshold:
-        print(f"!!! ALERTA DE STOCK BAJO: El ítem '{item_for_threshold_check.name}' tiene {item_for_threshold_check.quantity} unidades. El umbral es {item_for_threshold_check.low_stock_threshold}.")
-    else:
-        print(f"Stock del ítem '{item_for_threshold_check.name}' es {item_for_threshold_check.quantity}. Umbral: {item_for_threshold_check.low_stock_threshold}. (Fuera de umbral de alerta)")
-    print(f"--- Señal 'post_save' finalizada para movimiento ID: {instance.pk} ---")
+    # Verificar el umbral de stock bajo y fechas de vencimiento
+    if item_updated_from_db.quantity <= item_updated_from_db.low_stock_threshold:
+        print(f"!!! ALERTA DE STOCK BAJO: El ítem '{item_updated_from_db.name}' tiene {item_updated_from_db.quantity} unidades. El umbral es {item_updated_from_db.low_stock_threshold}.")
+    
+    if item_updated_from_db.is_expired:
+        print(f"!!! ALERTA DE VENCIMIENTO: El ítem '{item_updated_from_db.name}' ha VENCIDO el {item_updated_from_db.expiration_date}.")
+    elif item_updated_from_db.is_expiring_soon:
+        print(f"!!! ALERTA DE VENCIMIENTO PROXIMO: El ítem '{item_updated_from_db.name}' vencerá pronto ({item_updated_from_db.expiration_date}).")
 
 
-# Señal pre_delete para revertir el stock cuando un movimiento es eliminado
 @receiver(pre_delete, sender=InventoryMovement)
 def revert_inventory_quantity_on_delete(sender, instance, **kwargs):
-    print(f"--- Señal 'pre_delete' para InventoryMovement activada (ID: {instance.pk}) ---")
+    """
+    Revertir el stock del InventoryItem cuando un InventoryMovement es eliminado.
+    """
     try:
         item = InventoryItem.objects.get(pk=instance.item.pk)
         
-        # Calcular la cantidad después de revertir el movimiento
         reverted_quantity = item.quantity
         if instance.movement_type == 'ENTRADA' or instance.movement_type == 'DEVOLUCION':
             reverted_quantity -= instance.quantity
-            print(f"DEBUG: Revirtiendo ENTRADA/DEVOLUCION de {instance.quantity} para '{item.name}'. Nueva cantidad: {reverted_quantity}")
         elif instance.movement_type == 'SALIDA' or instance.movement_type == 'TRANSFERENCIA':
             reverted_quantity += instance.quantity
-            print(f"DEBUG: Revirtiendo SALIDA/TRANSFERENCIA de {instance.quantity} para '{item.name}'. Nueva cantidad: {reverted_quantity}")
         
-        # Guardar el InventoryItem actualizado directamente en la base de datos
         InventoryItem.objects.filter(pk=item.pk).update(quantity=reverted_quantity)
         
-        print(f"STOCK REVERTIDO: Stock de '{item.name}' actualizado a {reverted_quantity} debido a la eliminación del movimiento {instance.pk}.")
-
         # Opcional: Re-verificar umbral después de la eliminación
         item_after_revert = InventoryItem.objects.get(pk=item.pk)
         if item_after_revert.quantity <= item_after_revert.low_stock_threshold:
             print(f"!!! ALERTA DE STOCK BAJO DESPUÉS DE REVERTIR: El ítem '{item_after_revert.name}' tiene {item_after_revert.quantity} unidades. El umbral es {item_after_revert.low_stock_threshold}.")
-        else:
-            print(f"Stock del ítem '{item_after_revert.name}' después de revertir es {item_after_revert.quantity}. (Fuera de umbral de alerta)")
-
+        
+        if item_after_revert.is_expired:
+            print(f"!!! ALERTA DE VENCIMIENTO DESPUÉS DE REVERTIR: El ítem '{item_after_revert.name}' ha VENCIDO el {item_after_revert.expiration_date}.")
+        elif item_after_revert.is_expiring_soon:
+            print(f"!!! ALERTA DE VENCIMIENTO PROXIMO DESPUÉS DE REVERTIR: El ítem '{item_after_revert.name}' vencerá pronto ({item_after_revert.expiration_date}).")
 
     except InventoryItem.DoesNotExist:
         print(f"ERROR: InventoryItem con ID {instance.item.pk} no encontrado durante pre_delete para movimiento {instance.pk}.")
     except Exception as e:
         print(f"ERROR: Fallo al revertir stock para '{instance.item.name}' en pre_delete: {e}")
-    print(f"--- Señal 'pre_delete' finalizada para movimiento ID: {instance.pk} ---")
+

@@ -15,7 +15,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-^c^d-m%n&s+&8v-m1n*1*d)0+m_y9b75-p0(1b=5z*!j@m&s=l'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+DEBUG = True
 
 ALLOWED_HOSTS = [
     'localhost',
@@ -145,5 +145,9 @@ REST_FRAMEWORK = {
 AUTH_USER_MODEL = 'inventory.UserProfile'
 
 # Configuración de django-cors-headers
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "https://Sipios.pythonanywhere.com", # Tu propio backend
+    "https://maestranza-frontend.vercel.app", # ¡Pega la URL EXACTA de Vercel aquí!
+]
 CORS_ALLOW_CREDENTIALS = True # Permite cookies, encabezados de autorización, etc.
